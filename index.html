@@ -5,7 +5,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TRON GasFree — Панель управления</title>
-<script src="https://cdn.jsdelivr.net/npm/tronweb@6.0.0/dist/TronWeb.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tronweb@5.3.2/dist/TronWeb.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -357,6 +357,7 @@ body::after { content:''; position:fixed; top:-300px; right:-300px; width:700px;
       <button class="btn btn-outline" onclick="loadConfigFromStorage();toast('Загружено из хранилища','success')">↻ Загрузить</button>
       <button class="btn btn-ghost btn-sm" onclick="testGasFreeConnection()">⚡ Тест GasFree</button>
       <button class="btn btn-ghost btn-sm" onclick="testTronGrid()">⬡ Тест TronGrid</button>
+      <button class="btn btn-ghost btn-sm" onclick="testTronWeb()">🔑 Тест TronWeb</button>
       <button class="btn btn-danger btn-sm" style="margin-left:auto" onclick="clearAllConfig()">⚠ Очистить</button>
     </div>
   </div>
@@ -662,39 +663,75 @@ async function fetchTxHistory(address) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TRONWEB — WALLET GENERATION
+// TRONWEB — RESOLVE CONSTRUCTOR (handles v5/v6 CDN bundle differences)
 // ═══════════════════════════════════════════════════════════════
-function getTronWeb() {
+function resolveTronWebClass() {
+  // Try all known export paths
+  if (typeof TronWeb === 'function') return TronWeb;
+  if (typeof TronWeb === 'object' && TronWeb !== null) {
+    if (typeof TronWeb.TronWeb === 'function') return TronWeb.TronWeb;
+    if (typeof TronWeb.default === 'function') return TronWeb.default;
+  }
+  if (window.TronWeb && typeof window.TronWeb === 'function') return window.TronWeb;
+  if (window.TronWeb && typeof window.TronWeb.TronWeb === 'function') return window.TronWeb.TronWeb;
+  throw new Error('TronWeb не загружен. Проверьте подключение к интернету и перезагрузите страницу.');
+}
+
+function getTronWeb(privKey) {
+  const TW = resolveTronWebClass();
   const { rpc, tgKey } = cfg();
   const headers = tgKey ? { 'TRON-PRO-API-KEY': tgKey } : {};
-  return new TronWeb({ fullHost: rpc, headers });
+  const tw = new TW({ fullHost: rpc, headers });
+  if (privKey) tw.setPrivateKey(privKey);
+  return tw;
 }
 
 function generateRealWallet() {
-  // TronWeb generates a proper secp256k1 keypair + base58check TRON address
-  const tw = getTronWeb();
-  const account = tw.utils.accounts.generateAccount();
-  // account = { privateKey, publicKey, address: { base58, hex } }
-  return {
-    privateKey: account.privateKey,
-    address: account.address.base58
-  };
+  const TW = resolveTronWebClass();
+  const { rpc, tgKey } = cfg();
+  const headers = tgKey ? { 'TRON-PRO-API-KEY': tgKey } : {};
+  const tw = new TW({ fullHost: rpc, headers });
+
+  // v5: tw.utils.accounts.generateAccount()
+  // v6: TronWeb.createAccount() or tw.createAccount()
+  let account;
+  if (tw.utils && tw.utils.accounts && typeof tw.utils.accounts.generateAccount === 'function') {
+    account = tw.utils.accounts.generateAccount();
+    return { privateKey: account.privateKey, address: account.address.base58 };
+  }
+  if (typeof TW.createAccount === 'function') {
+    account = TW.createAccount();
+    return { privateKey: account.privateKey, address: account.address.base58 };
+  }
+  if (typeof tw.createAccount === 'function') {
+    account = tw.createAccount();
+    return { privateKey: account.privateKey, address: account.address.base58 };
+  }
+  // Fallback: generate via TronWeb.utils.ethersUtils if available
+  if (tw.utils && tw.utils.ethersUtils) {
+    const wallet = tw.utils.ethersUtils.Wallet.createRandom();
+    const privHex = wallet.privateKey.replace(/^0x/, '');
+    const addr = tw.address.fromPrivateKey(privHex);
+    return { privateKey: privHex, address: addr };
+  }
+  throw new Error('Не удалось найти метод генерации кошелька в TronWeb. Версия: ' + (TW.version || '?'));
 }
 
 function deriveAddressFromKey(privKey) {
   const tw = getTronWeb();
+  // v5/v6 both support this
   const addr = tw.address.fromPrivateKey(privKey);
-  return addr; // base58 TRON address
+  if (!addr) throw new Error('Не удалось получить адрес из ключа');
+  return addr;
 }
 
 // ═══════════════════════════════════════════════════════════════
 // TIP-712 SIGNATURE
 // ═══════════════════════════════════════════════════════════════
 async function signPermitTransfer(privKey, permitMessage) {
-  const tw = getTronWeb();
-  tw.setPrivateKey(privKey);
+  const tw = getTronWeb(privKey);
   const domain = cfg().net === 'nile' ? GASFREE_DOMAIN_NILE : GASFREE_DOMAIN_MAINNET;
-  // _signTypedData returns hex string with 0x prefix — remove it
+  // _signTypedData returns hex string, may or may not have 0x prefix
   const sig = await tw.trx._signTypedData(domain, PERMIT_TYPES, permitMessage);
   return sig.replace(/^0x/, '');
 }
@@ -747,6 +784,26 @@ async function testTronGrid() {
     const d = await res.json();
     toast(`TronGrid OK · блок #${d.block_header?.raw_data?.number||'?'}`, 'success');
   } catch(e) { toast('TronGrid ошибка: '+e.message, 'error'); }
+}
+
+function testTronWeb() {
+  try {
+    const TW = resolveTronWebClass();
+    // Try to generate a test wallet
+    const wallet = generateRealWallet();
+    toast(`TronWeb OK · адрес: ${wallet.address.substring(0,12)}…`, 'success');
+    console.log('[TronWeb test] Generated address:', wallet.address);
+    console.log('[TronWeb test] TronWeb constructor:', TW.name || typeof TW);
+  } catch(e) {
+    // Show detailed debug info
+    const info = [
+      'typeof TronWeb = ' + typeof TronWeb,
+      typeof TronWeb === 'object' ? 'keys: ' + Object.keys(TronWeb||{}).join(', ') : '',
+      'window.TronWeb = ' + typeof window.TronWeb,
+    ].filter(Boolean).join(' | ');
+    toast('TronWeb ошибка: ' + e.message, 'error');
+    console.error('[TronWeb debug]', info, e);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
